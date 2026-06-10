@@ -130,18 +130,8 @@ Steps remaining to get the Nano 33 BLE working as a full AirTag-style tracker on
 
 The pouch needs its own FMD server account so it appears as a separate device on the map.
 
-- [ ] Register account via curl (run from any machine):
-  ```bash
-  curl -X POST https://lintu-server.duckdns.org/api/v1/register \
-    -H "Content-Type: application/json" \
-    -d '{
-      "username": "securepouch-001",
-      "password": "<choose a password>",
-      "registrationToken": "<vault_lintu_registration_token>"
-    }'
-  ```
-  Save the returned access token — the Android app will use it to post locations.
-- [ ] Confirm the device account appears in the FMD web dashboard
+- [ ] Register the device account via `BleTrackerRepository.registerPouch()` in the Android app (see step 3 — the app handles key generation and all crypto). There is no manual curl path; the FMD registration protocol requires an RSA key pair that the app generates.
+- [ ] Confirm the device account appears in the FMD web dashboard after registration
 
 ### 3 — Android app: BLE scanner service
 
