@@ -1,0 +1,5 @@
+# PlatformIO build output
+.pio/
+
+# Zephyr/west build directory
+build/
