@@ -4,7 +4,7 @@
 // --- Device configuration ---
 // Set this to the UID registered for this device in the FMD server.
 // Each unit needs a unique value flashed before deployment.
-static const char* DEVICE_UID = "YOUR-DEVICE-UID-HERE";
+static const char* DEVICE_UID = "securepouch-001";
 
 // --- BLE objects ---
 BLEService spService(SP_SERVICE_UUID);
