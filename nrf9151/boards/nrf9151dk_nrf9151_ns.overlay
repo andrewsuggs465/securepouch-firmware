@@ -1,0 +1,43 @@
+/*
+ * SecurePouch nRF9151 — inter-MCU UART to the nRF52840.
+ *
+ * uart0 = console/shell, uart1 = arduino_serial (board defaults). We claim
+ * uart2 for the link to the nRF52840:
+ *   P0.00 = TX  -> nRF52840 RX0 (D0)
+ *   P0.01 = RX  <- nRF52840 TX1 (D1)
+ * No hardware flow control on the breadboard.
+ */
+
+&pinctrl {
+	uart2_default: uart2_default {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 0)>;   /* P0.00 -> 52840 RX */
+		};
+		group2 {
+			psels = <NRF_PSEL(UART_RX, 0, 1)>;   /* P0.01 <- 52840 TX */
+			bias-pull-up;
+		};
+	};
+
+	uart2_sleep: uart2_sleep {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 0)>,
+				<NRF_PSEL(UART_RX, 0, 1)>;
+			low-power-enable;
+		};
+	};
+};
+
+&uart2 {
+	status = "okay";
+	current-speed = <115200>;
+	pinctrl-0 = <&uart2_default>;
+	pinctrl-1 = <&uart2_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+/ {
+	chosen {
+		securepouch,mcu-link = &uart2;
+	};
+};
