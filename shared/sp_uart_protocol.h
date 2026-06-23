@@ -8,7 +8,7 @@
  *
  *   nRF52840 Serial1 TX1 (P1.03 / D1) ----> nRF9151 P0.01 (RX)
  *   nRF52840 Serial1 RX0 (P1.10 / D0) <---- nRF9151 P0.00 (TX)
- *   nRF52840 D14 -----------------------> nRF9151 RESET  (active low, drive low to reset)
+ *   nRF52840 D17/A3 --------------------> nRF9151 RESET  (active low, drive low to reset)
  *
  * Baud: 115200 8N1, no flow control.
  *

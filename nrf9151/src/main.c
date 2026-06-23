@@ -58,10 +58,18 @@ LOG_MODULE_REGISTER(securepouch_rcp, LOG_LEVEL_INF);
 #ifndef SP_DEVICE_UID
 #define SP_DEVICE_UID "securepouch-001"
 #endif
+#ifndef SP_FIRMWARE_ROLE
+#define SP_FIRMWARE_ROLE "nRF9151-DK standalone LTE/GNSS"
+#endif
 /* FMD access token (IDT). Provision via -DSP_FMD_TOKEN=... or set here.
  * Empty token => uploads/polls are skipped (modem still attaches + fixes). */
 #ifndef SP_FMD_TOKEN
 #define SP_FMD_TOKEN  ""
+#endif
+/* APN for the IoT SIM (e.g. "onomondo", "melita", a Conexa APN). Empty => let
+ * the modem use the network-provided default. Set via -DSP_APN='"onomondo"'. */
+#ifndef SP_APN
+#define SP_APN  ""
 #endif
 
 #define LOCATION_PATH "/api/v1/location"
@@ -83,6 +91,7 @@ static K_SEM_DEFINE(lte_connected, 0, 1);
 static atomic_t lte_registered = ATOMIC_INIT(0);
 static struct location_data last_fix;
 static bool have_fix;
+static atomic_t location_in_progress = ATOMIC_INIT(0);
 static atomic_t pouch_status = ATOMIC_INIT(0);   /* mirror of 52840 status byte */
 static atomic_t pouch_battery = ATOMIC_INIT(100);
 static atomic_t upload_request = ATOMIC_INIT(0); /* set by "UP:" from 52840 */
@@ -138,9 +147,13 @@ static void handle_mcu_line(char *line)
 	const char *payload = sep + 1;
 
 	if (strcmp(tag, SP_MSG_STATUS) == 0) {
-		/* payload: "<status>,bat=<n>" */
+		/* payload: "<status>" or "<status>,bat=<n>" */
 		unsigned int st = 0, bat = 100;
-		sscanf(payload, "%u,bat=%u", &st, &bat);
+		sscanf(payload, "%u", &st);
+		const char *bat_p = strstr(payload, "bat=");
+		if (bat_p) {
+			sscanf(bat_p, "bat=%u", &bat);
+		}
 		atomic_set(&pouch_status, st);
 		atomic_set(&pouch_battery, bat);
 	} else if (strcmp(tag, SP_MSG_UPLOAD_NOW) == 0) {
@@ -186,24 +199,134 @@ static void lte_handler(const struct lte_lc_evt *const evt)
 	}
 }
 
+/* Set the APN on the default PDN context (CID 0). Must be done with the modem
+ * offline (CFUN=0) — call before lte_lc_connect(). No-op if SP_APN is empty. */
+static void configure_apn(void)
+{
+	if (strlen(SP_APN) == 0) {
+		LOG_INF("APN: using network default");
+		return;
+	}
+	/* Modem must be offline to change CID 0. nrf_modem_lib_init() leaves it in
+	 * CFUN=0, but be explicit in case of a warm restart. */
+	(void)nrf_modem_at_printf("AT+CFUN=0");
+	int err = nrf_modem_at_printf("AT+CGDCONT=0,\"IP\",\"%s\"", SP_APN);
+	if (err) {
+		LOG_ERR("failed to set APN '%s' (err %d)", SP_APN, err);
+	} else {
+		LOG_INF("APN set to '%s'", SP_APN);
+	}
+}
+
+/* Dump the modem's raw, unfiltered replies to the SIM-related AT commands.
+ * This is the ground-truth diagnostic: if %XSIM stays 0 here, it is a physical
+ * contact / card-holder / SIM-power issue, not firmware or SW1. */
+static void dump_raw_sim_at(void)
+{
+	static const char *cmds[] = {
+		"AT+CFUN?",      /* functional mode — must be 1/4 to power the UICC */
+		"AT%XSIM?",      /* 1 = SIM present & initialised */
+		"AT+CPIN?",      /* READY / SIM PIN / SIM not inserted */
+		"AT%XICCID",     /* card serial — only answers if a card responds */
+		"AT+CIMI",       /* IMSI — only with a live SIM */
+	};
+	char buf[160];
+	for (size_t i = 0; i < ARRAY_SIZE(cmds); i++) {
+		int err = nrf_modem_at_cmd(buf, sizeof(buf), "%s", cmds[i]);
+		if (err == 0) {
+			LOG_INF("RAW %s -> %s", cmds[i], buf);
+		} else {
+			LOG_WRN("RAW %s -> error %d", cmds[i], err);
+		}
+	}
+}
+
 /* Log SIM + modem state so a missing/inactive SIM is visible instead of a
- * silent forever-block on attach. Returns true if a SIM appears usable. */
+ * silent forever-block on attach. Returns true if a SIM appears usable.
+ *
+ * The SIM subsystem can take a moment to come up after boot, so we poll
+ * %XSIM (1 = card present & initialised) and CPIN with a few retries before
+ * giving up, and log the raw responses so the failure cause is visible. */
 static bool log_modem_diagnostics(void)
 {
-	char buf[64];
+	char buf[96];
 	bool sim_ok = false;
-
-	if (nrf_modem_at_scanf("AT+CPIN?", "+CPIN: %63[^\r\n]", buf) == 1) {
-		LOG_INF("SIM (CPIN): %s", buf);
-		sim_ok = (strstr(buf, "READY") != NULL);
-	} else {
-		LOG_WRN("SIM not detected (AT+CPIN? failed) — insert/activate a SIM");
-	}
+	int xsim = 0;
 
 	if (nrf_modem_at_cmd(buf, sizeof(buf), "AT+CGSN=1") == 0) {
 		LOG_INF("modem IMEI: %s", buf);
 	}
+
+	for (int attempt = 0; attempt < 10 && !sim_ok; attempt++) {
+		/* %XSIM: <0|1> — 1 means a SIM is present and initialised. */
+		if (nrf_modem_at_scanf("AT%%XSIM?", "%%XSIM: %d", &xsim) == 1 && xsim == 1) {
+			sim_ok = true;
+			break;
+		}
+		/* Fall back to CPIN; READY also means usable. */
+		if (nrf_modem_at_scanf("AT+CPIN?", "+CPIN: %95[^\r\n]", buf) == 1 &&
+		    strstr(buf, "READY") != NULL) {
+			sim_ok = true;
+			break;
+		}
+		/* Halfway through, force the modem to power-cycle and re-read the SIM.
+		 * CFUN=1 (full functional) powers the UICC; CFUN=41 explicitly
+		 * re-activates the UICC without enabling the radio. A debugger
+		 * pin-reset alone does not re-power the SIM. */
+		if (attempt == 4) {
+			LOG_INF("re-initialising SIM (CFUN power-cycle)...");
+			(void)nrf_modem_at_printf("AT+CFUN=0");
+			k_sleep(K_MSEC(500));
+			(void)nrf_modem_at_printf("AT+CFUN=1"); /* full: powers UICC */
+			k_sleep(K_MSEC(2000));
+		}
+		k_sleep(K_MSEC(500));
+	}
+
+	if (sim_ok) {
+		if (nrf_modem_at_scanf("AT+CPIN?", "+CPIN: %95[^\r\n]", buf) == 1) {
+			LOG_INF("SIM ready (CPIN: %s, XSIM: %d)", buf, xsim);
+		} else {
+			LOG_INF("SIM ready (XSIM: %d)", xsim);
+		}
+		/* ICCID — confirms WHICH of several SIMs is inserted. */
+		if (nrf_modem_at_scanf("AT%%XICCID", "%%XICCID: %95[^\r\n]", buf) == 1) {
+			LOG_INF("SIM ICCID: %s", buf);
+		}
+	} else {
+		/* Log the raw CPIN response so we can tell no-SIM from PIN-locked/busy. */
+		if (nrf_modem_at_cmd(buf, sizeof(buf), "AT+CPIN?") == 0) {
+			LOG_WRN("SIM not ready (XSIM:%d) — CPIN raw: %s", xsim, buf);
+		} else {
+			LOG_WRN("SIM not detected (XSIM:%d, CPIN errored)", xsim);
+		}
+		/* Raw AT dump for ground-truth: distinguishes physical contact / power
+		 * problems (all error) from card-state issues (CPIN reports a reason). */
+		dump_raw_sim_at();
+	}
 	return sim_ok;
+}
+
+/* Log network attach details (operator, band, signal) for debugging which
+ * network the SIM roamed onto and how strong the signal is. Safe to call
+ * repeatedly; fields are only populated once registered. */
+static void log_network_status(void)
+{
+	char op[32] = "";
+	int band = 0;
+	char raw[160];
+
+	/* %XMONITOR returns reg_status, full/short op name, PLMN, TAC, AcT, band,
+	 * cell id, ... — log the raw line; it's the single most useful diagnostic. */
+	if (nrf_modem_at_cmd(raw, sizeof(raw), "AT%%XMONITOR") == 0) {
+		LOG_INF("XMONITOR: %s", raw);
+	}
+	/* Operator name + band, parsed for a concise line. */
+	if (nrf_modem_at_scanf("AT%%XMONITOR",
+			       "%%XMONITOR: %*d,\"%31[^\"]\",%*[^,],%*[^,],%*[^,],%*[^,],%*[^,],%d",
+			       op, &band) >= 1) {
+		LOG_INF("registered on '%s' band %d", op, band);
+	}
 }
 
 /* ========================================================================= */
@@ -215,6 +338,7 @@ static void location_event_handler(const struct location_event_data *event_data)
 	case LOCATION_EVT_LOCATION:
 		last_fix = event_data->location;
 		have_fix = true;
+		atomic_set(&location_in_progress, 0);
 		LOG_INF("fix: %.06f, %.06f (+/- %d m)",
 			last_fix.latitude, last_fix.longitude,
 			(int)last_fix.accuracy);
@@ -226,9 +350,11 @@ static void location_event_handler(const struct location_event_data *event_data)
 		}
 		break;
 	case LOCATION_EVT_TIMEOUT:
+		atomic_set(&location_in_progress, 0);
 		LOG_WRN("location request timed out");
 		break;
 	case LOCATION_EVT_ERROR:
+		atomic_set(&location_in_progress, 0);
 		LOG_WRN("location request error");
 		break;
 	default:
@@ -238,14 +364,21 @@ static void location_event_handler(const struct location_event_data *event_data)
 
 static void request_location(void)
 {
+	if (atomic_get(&location_in_progress) == 1) {
+		LOG_INF("location request already in progress; reusing pending fix attempt");
+		return;
+	}
+
 	struct location_config config;
 	enum location_method methods[] = {
 		LOCATION_METHOD_GNSS,       /* TODO(P3): add CELLULAR fallback + nRF Cloud */
 	};
 
 	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
+	atomic_set(&location_in_progress, 1);
 	int err = location_request(&config);
 	if (err) {
+		atomic_set(&location_in_progress, 0);
 		LOG_ERR("location_request failed: %d", err);
 	}
 }
@@ -357,7 +490,7 @@ static int build_location_json(char *out, size_t out_len)
 		"\\\"lon\\\":%.6f,"
 		"\\\"bat\\\":%d,"
 		"\\\"date\\\":%lld,"
-		"\\\"provider\\\":\\\"gps\\\","
+			"\\\"provider\\\":\\\"nrf9151-gnss\\\","
 		"\\\"accuracy\\\":%d}\"}",
 		SP_FMD_TOKEN,
 		last_fix.latitude, last_fix.longitude,
@@ -383,9 +516,20 @@ static void upload_location(void)
 		return;
 	}
 	int code = http_request(HTTP_POST, LOCATION_PATH, json);
-	LOG_INF("location upload -> HTTP %d", code);
+	LOG_INF("9151 standalone location upload -> HTTP %d", code);
 	if (code == 200) {
 		uart_send_line(SP_MSG_RCP_STATUS, "REG");
+	} else if (code == 401) {
+		/* Token expired. Full re-auth requires P3 crypto; for the demo build
+		 * just notify the 52840 so the status LED reflects the failure. The
+		 * fix is to re-flash with a fresh SP_FMD_TOKEN (./west build ... --
+		 * -DSP_FMD_TOKEN=<new_token>). */
+		LOG_ERR("location upload 401 — token expired; reflash with a fresh SP_FMD_TOKEN");
+		uart_send_line(SP_MSG_RCP_STATUS, "NO_TOKEN");
+	} else if (code >= 300 && code < 400) {
+		LOG_WRN("location upload redirected; production server likely requires HTTPS/TLS");
+	} else if (code < 0) {
+		LOG_ERR("location upload network error: %d", code);
 	}
 }
 
@@ -399,7 +543,19 @@ static void poll_command(void)
 	snprintf(body, sizeof(body), "{\"IDT\":\"%s\",\"Data\":\"\"}", SP_FMD_TOKEN);
 
 	int code = http_request(HTTP_PUT, COMMAND_PATH, body);
+	LOG_INF("9151 standalone command poll -> HTTP %d (body_len=%u)",
+		code, (unsigned int)http_body_len);
+	if (code == 401) {
+		LOG_ERR("command poll 401 — token expired; reflash with a fresh SP_FMD_TOKEN");
+		uart_send_line(SP_MSG_RCP_STATUS, "NO_TOKEN");
+		return;
+	}
 	if (code != 200 || http_body_len == 0) {
+		if (code >= 300 && code < 400) {
+			LOG_WRN("command poll redirected; production server likely requires HTTPS/TLS");
+		} else if (code != 200) {
+			LOG_WRN("command poll failed (HTTP %d); check token or server reachability", code);
+		}
 		return;
 	}
 
@@ -407,15 +563,17 @@ static void poll_command(void)
 	 * Minimal extraction of the Data field (no full JSON parse needed). */
 	char *p = strstr(http_body, "\"Data\":\"");
 	if (!p) {
+		LOG_WRN("command poll response missing Data field");
 		return;
 	}
 	p += strlen("\"Data\":\"");
 	char *end = strchr(p, '"');
 	if (!end || end == p) {
+		LOG_INF("command poll: no pending command");
 		return;   /* empty Data => no pending command */
 	}
 	*end = '\0';
-	LOG_INF("server command: %s", p);
+	LOG_INF("server command via 9151 LTE path: %s", p);
 	uart_send_line(SP_MSG_COMMAND, p);
 	/* TODO(P3): verify CmdSig (RSA-PSS over "UnixTime:Data") before acting. */
 }
@@ -438,7 +596,9 @@ K_THREAD_DEFINE(uart_worker_id, 2048, uart_worker, NULL, NULL, NULL, 7, 0, 0);
 /* ========================================================================= */
 int main(void)
 {
-	LOG_INF("SecurePouch RCP starting (uid=%s)", SP_DEVICE_UID);
+	LOG_INF("SecurePouch starting uid=%s role=%s host=%s apn=%s token=%s",
+		SP_DEVICE_UID, SP_FIRMWARE_ROLE, SP_FMD_HOST, SP_APN,
+		strlen(SP_FMD_TOKEN) == 0 ? "missing" : "set");
 
 	if (!device_is_ready(mcu_uart)) {
 		LOG_ERR("MCU-link UART not ready");
@@ -447,6 +607,11 @@ int main(void)
 	uart_irq_callback_user_data_set(mcu_uart, uart_isr, NULL);
 	uart_irq_rx_enable(mcu_uart);
 	uart_send_line(SP_MSG_RCP_STATUS, "BOOT");
+	uart_send_line(SP_MSG_RCP_STATUS, "mode=9151-lte");  /* informational; 52840 ignores unknown tokens */
+	if (strlen(SP_FMD_TOKEN) == 0) {
+		uart_send_line(SP_MSG_RCP_STATUS, "NO_TOKEN");
+		LOG_WRN("no FMD token built in — standalone server polling/uploads disabled");
+	}
 
 	int err = nrf_modem_lib_init();
 	if (err) {
@@ -465,6 +630,8 @@ int main(void)
 		uart_send_line(SP_MSG_RCP_STATUS, "NO_SIM");
 	}
 
+	configure_apn();   /* must run while modem is offline (before connect) */
+
 	lte_lc_register_handler(lte_handler);
 	LOG_INF("connecting to LTE-M...");
 	uart_send_line(SP_MSG_RCP_STATUS, "LTE_SEARCH");
@@ -478,6 +645,7 @@ int main(void)
 	bool lte_up = (k_sem_take(&lte_connected, K_SECONDS(120)) == 0);
 	if (lte_up) {
 		uart_send_line(SP_MSG_RCP_STATUS, "LTE_UP");
+		log_network_status();
 		(void)date_time_update_async(NULL);
 	} else {
 		LOG_WRN("LTE not up after 120s — continuing; will retry uploads when registered");
@@ -496,6 +664,7 @@ int main(void)
 		if (registered && !announced_up) {
 			announced_up = true;
 			uart_send_line(SP_MSG_RCP_STATUS, "LTE_UP");
+			log_network_status();
 			(void)date_time_update_async(NULL);
 		}
 
