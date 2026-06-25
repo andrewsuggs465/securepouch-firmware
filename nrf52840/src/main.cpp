@@ -27,6 +27,7 @@
 
 #include "ble_protocol.h"
 #include "sp_uart_protocol.h"
+#include "ble_bond_store.h"
 
 // ---------------------------------------------------------------------------
 // Device configuration
@@ -640,6 +641,8 @@ static void setupBle() {
   deviceIdChar.writeValue(DEVICE_UID);
   statusChar.writeValue(statusByte());
   batteryLevelChar.writeValue(g_state.battery);
+
+  ble_bond_store_init();   // register LTK/IRK flash callbacks before advertising
 
   BLE.setEventHandler(BLEConnected, onConnect);
   BLE.setEventHandler(BLEDisconnected, onDisconnect);
