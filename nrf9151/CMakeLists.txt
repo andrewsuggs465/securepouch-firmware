@@ -15,9 +15,13 @@ set(SP_FMD_TOKEN "" CACHE STRING "FMD server access token (IDT)")
 set(SP_DEVICE_UID "securepouch-001" CACHE STRING "FMD device UID / username")
 set(SP_FMD_HOST "lintu-server.myvnc.com" CACHE STRING "FMD server host")
 set(SP_FIRMWARE_ROLE "nRF9151-DK standalone LTE/GNSS" CACHE STRING "Human-readable firmware role")
+set(SP_OPENCELLID_TOKEN "" CACHE STRING "OpenCellID API token for cellular location fallback")
 
 if(DEFINED ENV{SP_FMD_TOKEN} AND NOT "$ENV{SP_FMD_TOKEN}" STREQUAL "")
     set(SP_FMD_TOKEN "$ENV{SP_FMD_TOKEN}")
+endif()
+if(DEFINED ENV{SP_OPENCELLID_TOKEN} AND NOT "$ENV{SP_OPENCELLID_TOKEN}" STREQUAL "")
+    set(SP_OPENCELLID_TOKEN "$ENV{SP_OPENCELLID_TOKEN}")
 endif()
 
 target_compile_definitions(app PRIVATE
@@ -26,4 +30,5 @@ target_compile_definitions(app PRIVATE
     SP_DEVICE_UID="${SP_DEVICE_UID}"
     SP_FMD_HOST="${SP_FMD_HOST}"
     SP_FIRMWARE_ROLE="${SP_FIRMWARE_ROLE}"
+    SP_OPENCELLID_TOKEN="${SP_OPENCELLID_TOKEN}"
 )

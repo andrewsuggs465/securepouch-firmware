@@ -33,11 +33,13 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/net/socket.h>
+#include <zephyr/net/tls_credentials.h>
 #include <zephyr/net/http/client.h>
 
 #include <modem/nrf_modem_lib.h>
 #include <modem/lte_lc.h>
 #include <modem/location.h>
+#include <modem/modem_key_mgmt.h>
 #include <nrf_modem_at.h>
 #include <date_time.h>
 
@@ -52,8 +54,9 @@ LOG_MODULE_REGISTER(securepouch_rcp, LOG_LEVEL_INF);
 #ifndef SP_FMD_HOST
 #define SP_FMD_HOST   "lintu-server.myvnc.com"
 #endif
+/* HTTPS on 443 — Caddy on the server handles TLS termination. */
 #ifndef SP_FMD_PORT
-#define SP_FMD_PORT   "80"           /* plaintext for the prototype */
+#define SP_FMD_PORT   "443"
 #endif
 #ifndef SP_DEVICE_UID
 #define SP_DEVICE_UID "securepouch-001"
@@ -71,12 +74,23 @@ LOG_MODULE_REGISTER(securepouch_rcp, LOG_LEVEL_INF);
 #ifndef SP_APN
 #define SP_APN  ""
 #endif
+/* OpenCellID API token for cellular location fallback.
+ * Pass at build time: -DSP_OPENCELLID_TOKEN=pk.xxxxx
+ * Without this the cellular fallback request is skipped. */
+#ifndef SP_OPENCELLID_TOKEN
+#define SP_OPENCELLID_TOKEN  ""
+#endif
 
 #define LOCATION_PATH "/api/v1/location"
 #define COMMAND_PATH  "/api/v1/command"
 
-#define UPLOAD_PERIOD_MS  (5 * 60 * 1000)   /* periodic location upload */
-#define POLL_PERIOD_MS    (30 * 1000)       /* command poll cadence */
+/* TLS security tag under which we store the modem's peer-verify-none session.
+ * We use the modem's built-in CA roots (TLS_PEER_VERIFY_NONE for demo) so no
+ * certificate provisioning is required here. */
+#define SP_TLS_SEC_TAG  42
+
+#define UPLOAD_PERIOD_MS  (2 * 60 * 1000)   /* location upload interval (2 min for demo) */
+#define POLL_PERIOD_MS    (30 * 1000)        /* command poll cadence */
 
 /* ---- UART to the nRF52840 ----------------------------------------------- */
 #define MCU_UART_NODE DT_CHOSEN(securepouch_mcu_link)
@@ -85,6 +99,11 @@ static const struct device *mcu_uart = DEVICE_DT_GET(MCU_UART_NODE);
 static char rx_line[SP_UART_LINE_MAX];
 static size_t rx_len;
 K_MSGQ_DEFINE(uart_lines, SP_UART_LINE_MAX, 8, 4);
+
+/* ---- Forward declarations ------------------------------------------------ */
+#if defined(CONFIG_LOCATION_METHOD_CELLULAR)
+static void cellular_location_request(const struct location_data_cloud *req);
+#endif
 
 /* ---- State shared between threads ---------------------------------------- */
 static K_SEM_DEFINE(lte_connected, 0, 1);
@@ -95,6 +114,10 @@ static atomic_t location_in_progress = ATOMIC_INIT(0);
 static atomic_t pouch_status = ATOMIC_INIT(0);   /* mirror of 52840 status byte */
 static atomic_t pouch_battery = ATOMIC_INIT(100);
 static atomic_t upload_request = ATOMIC_INIT(0); /* set by "UP:" from 52840 */
+
+/* Cached resolved address for SP_FMD_HOST — resolved once after LTE attach. */
+static struct sockaddr_storage fmd_server_addr;
+static bool fmd_addr_cached = false;
 
 /* ========================================================================= */
 /* UART bridge                                                               */
@@ -339,9 +362,9 @@ static void location_event_handler(const struct location_event_data *event_data)
 		last_fix = event_data->location;
 		have_fix = true;
 		atomic_set(&location_in_progress, 0);
-		LOG_INF("fix: %.06f, %.06f (+/- %d m)",
+		LOG_INF("fix: %.06f, %.06f (+/- %d m) method=%d",
 			last_fix.latitude, last_fix.longitude,
-			(int)last_fix.accuracy);
+			(int)last_fix.accuracy, (int)event_data->method);
 		{
 			char fix[40];
 			snprintf(fix, sizeof(fix), "%.5f,%.5f",
@@ -351,12 +374,23 @@ static void location_event_handler(const struct location_event_data *event_data)
 		break;
 	case LOCATION_EVT_TIMEOUT:
 		atomic_set(&location_in_progress, 0);
-		LOG_WRN("location request timed out");
+		LOG_WRN("location request timed out (method=%d)", (int)event_data->method);
 		break;
 	case LOCATION_EVT_ERROR:
 		atomic_set(&location_in_progress, 0);
-		LOG_WRN("location request error");
+		LOG_WRN("location request error (method=%d)", (int)event_data->method);
 		break;
+	case LOCATION_EVT_FALLBACK:
+		LOG_INF("location: falling back to method %d", (int)event_data->method);
+		break;
+#if defined(CONFIG_LOCATION_METHOD_CELLULAR)
+	case LOCATION_EVT_CLOUD_LOCATION_EXT_REQUEST:
+		/* GNSS timed out; library wants us to resolve the cell data via our
+		 * own cloud service. Call OpenCellID and feed the result back. */
+		LOG_INF("location: GNSS timed out — querying OpenCellID for cellular fix");
+		cellular_location_request(&event_data->cloud_location_request);
+		break;
+#endif
 	default:
 		break;
 	}
@@ -371,10 +405,19 @@ static void request_location(void)
 
 	struct location_config config;
 	enum location_method methods[] = {
-		LOCATION_METHOD_GNSS,       /* TODO(P3): add CELLULAR fallback + nRF Cloud */
+		LOCATION_METHOD_GNSS,
+#if defined(CONFIG_LOCATION_METHOD_CELLULAR)
+		/* Cellular fallback via OpenCellID — fires
+		 * LOCATION_EVT_CLOUD_LOCATION_EXT_REQUEST when GNSS times out. */
+		LOCATION_METHOD_CELLULAR,
+#endif
 	};
 
 	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
+	/* GNSS timeout: 30 s indoors is enough to know it won't work; fall through
+	 * to cellular. Outdoors a cold-start fix arrives well within this window. */
+	config.methods[0].gnss.timeout = 30 * MSEC_PER_SEC;
+
 	atomic_set(&location_in_progress, 1);
 	int err = location_request(&config);
 	if (err) {
@@ -384,7 +427,7 @@ static void request_location(void)
 }
 
 /* ========================================================================= */
-/* HTTP                                                                       */
+/* HTTPS                                                                      */
 /* ========================================================================= */
 static uint8_t http_recv_buf[1024];
 static int http_status;
@@ -407,38 +450,68 @@ static int http_response_cb(struct http_response *rsp,
 	return 0;
 }
 
-/* One blocking HTTP request. Returns HTTP status code, or negative on error.
- * Response body (if any) is left in http_body / http_body_len. */
+/* Resolve SP_FMD_HOST once and cache the result. Returns 0 on success. */
+static int resolve_fmd_host(void)
+{
+	if (fmd_addr_cached) {
+		return 0;
+	}
+	struct zsock_addrinfo *res = NULL;
+	struct zsock_addrinfo hints = {
+		.ai_family   = AF_INET,
+		.ai_socktype = SOCK_STREAM,
+	};
+	int err = zsock_getaddrinfo(SP_FMD_HOST, SP_FMD_PORT, &hints, &res);
+	if (err || !res) {
+		LOG_ERR("DNS: getaddrinfo(%s) failed: %d", SP_FMD_HOST, err);
+		return -EIO;
+	}
+	memcpy(&fmd_server_addr, res->ai_addr, res->ai_addrlen);
+	zsock_freeaddrinfo(res);
+	fmd_addr_cached = true;
+	LOG_INF("DNS: %s resolved and cached", SP_FMD_HOST);
+	return 0;
+}
+
+/* One blocking HTTPS request to the cached FMD server address.
+ * Returns HTTP status code, or negative errno on network/TLS error.
+ * Response body (if any) is left in http_body / http_body_len.
+ *
+ * TLS: modem-offloaded TLS 1.2 with TLS_PEER_VERIFY_NONE (demo mode —
+ * no CA cert provisioning needed; upgrade to REQUIRED for production). */
 static int http_request(enum http_method method, const char *path,
 			const char *json)
 {
-	struct zsock_addrinfo *res = NULL;
-	struct zsock_addrinfo hints = {
-		.ai_family = AF_INET,
-		.ai_socktype = SOCK_STREAM,
-	};
-
 	http_status = 0;
 	http_body_len = 0;
 	http_body[0] = '\0';
 
-	int err = zsock_getaddrinfo(SP_FMD_HOST, SP_FMD_PORT, &hints, &res);
-	if (err) {
-		LOG_ERR("getaddrinfo(%s) failed: %d", SP_FMD_HOST, err);
+	if (resolve_fmd_host() != 0) {
 		return -EIO;
 	}
 
-	int sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TCP);
+	int sock = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TLS_1_2);
 	if (sock < 0) {
-		LOG_ERR("socket() failed: %d", -errno);
-		zsock_freeaddrinfo(res);
+		LOG_ERR("TLS socket() failed: %d", -errno);
+		fmd_addr_cached = false;   /* force re-resolve next time */
 		return -errno;
 	}
 
-	if (zsock_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-		LOG_ERR("connect() failed: %d", -errno);
+	/* TLS_PEER_VERIFY_NONE — demo convenience; no cert to provision.
+	 * For production: provision ISRG Root X1 PEM via modem_key_mgmt_write()
+	 * at sec_tag SP_TLS_SEC_TAG and switch verify to TLS_PEER_VERIFY_REQUIRED. */
+	int verify = TLS_PEER_VERIFY_NONE;
+	(void)zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY, &verify, sizeof(verify));
+
+	/* SNI: required for virtual-hosted servers (Caddy checks the hostname). */
+	(void)zsock_setsockopt(sock, SOL_TLS, TLS_HOSTNAME,
+			       SP_FMD_HOST, strlen(SP_FMD_HOST));
+
+	if (zsock_connect(sock, (struct sockaddr *)&fmd_server_addr,
+			  sizeof(struct sockaddr_in)) < 0) {
+		LOG_ERR("TLS connect() failed: %d (errno %d)", -errno, errno);
 		zsock_close(sock);
-		zsock_freeaddrinfo(res);
+		fmd_addr_cached = false;   /* address may have changed — re-resolve */
 		return -errno;
 	}
 
@@ -447,23 +520,22 @@ static int http_request(enum http_method method, const char *path,
 		NULL,
 	};
 	struct http_request req = {
-		.method = method,
-		.url = path,
-		.host = SP_FMD_HOST,
-		.protocol = "HTTP/1.1",
-		.header_fields = headers,
-		.response = http_response_cb,
-		.recv_buf = http_recv_buf,
-		.recv_buf_len = sizeof(http_recv_buf),
+		.method          = method,
+		.url             = path,
+		.host            = SP_FMD_HOST,
+		.protocol        = "HTTP/1.1",
+		.header_fields   = headers,
+		.response        = http_response_cb,
+		.recv_buf        = http_recv_buf,
+		.recv_buf_len    = sizeof(http_recv_buf),
 	};
 	if (json) {
-		req.payload = json;
+		req.payload     = json;
 		req.payload_len = strlen(json);
 	}
 
 	int ret = http_client_req(sock, &req, 15 * MSEC_PER_SEC, NULL);
 	zsock_close(sock);
-	zsock_freeaddrinfo(res);
 
 	if (ret < 0) {
 		LOG_ERR("http_client_req(%s) failed: %d", path, ret);
@@ -471,6 +543,149 @@ static int http_request(enum http_method method, const char *path,
 	}
 	return http_status;
 }
+
+/* ========================================================================= */
+/* OpenCellID — cellular location fallback                                    */
+/* ========================================================================= */
+/* Called from the location event handler when GNSS times out and the library
+ * fires LOCATION_EVT_CLOUD_LOCATION_EXT_REQUEST with serving-cell data.
+ * Queries the OpenCellID REST API and feeds the result back to the library. */
+#if defined(CONFIG_LOCATION_METHOD_CELLULAR)
+static void cellular_location_request(const struct location_data_cloud *req)
+{
+	if (strlen(SP_OPENCELLID_TOKEN) == 0) {
+		LOG_WRN("No SP_OPENCELLID_TOKEN built in — cellular location skipped");
+		location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_ERROR, NULL);
+		return;
+	}
+
+	const struct lte_lc_cell *cell = &req->cell_data->current_cell;
+	if (cell->id == LTE_LC_CELL_EUTRAN_ID_INVALID) {
+		LOG_WRN("No valid serving cell — cellular location skipped");
+		location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_ERROR, NULL);
+		return;
+	}
+
+	/* Build OpenCellID request body.
+	 * API: https://us1.unwiredlabs.com/v2/process
+	 * Required fields: token, radio, mcc, mnc, cells[{lac, cid}] */
+	char body[256];
+	int n = snprintf(body, sizeof(body),
+		"{\"token\":\"%s\",\"radio\":\"lte\",\"mcc\":%d,\"mnc\":%d,"
+		"\"cells\":[{\"lac\":%u,\"cid\":%u}],\"address\":1}",
+		SP_OPENCELLID_TOKEN,
+		cell->mcc, cell->mnc,
+		(unsigned)cell->tac, (unsigned)cell->id);
+	if (n <= 0 || (size_t)n >= sizeof(body)) {
+		LOG_ERR("OpenCellID body truncated");
+		location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_ERROR, NULL);
+		return;
+	}
+
+	/* Send HTTPS POST to OpenCellID.
+	 * We build a one-off connection here (different host than FMD server). */
+	static uint8_t ocid_recv_buf[512];
+	static char ocid_body[256];
+	static int ocid_status;
+	static size_t ocid_body_len;
+	ocid_status = 0; ocid_body_len = 0; ocid_body[0] = '\0';
+
+	struct zsock_addrinfo *res = NULL;
+	struct zsock_addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+	if (zsock_getaddrinfo("us1.unwiredlabs.com", "443", &hints, &res) || !res) {
+		LOG_ERR("DNS: us1.unwiredlabs.com failed");
+		location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_ERROR, NULL);
+		return;
+	}
+
+	int sock = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TLS_1_2);
+	if (sock < 0) {
+		zsock_freeaddrinfo(res);
+		location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_ERROR, NULL);
+		return;
+	}
+	int verify = TLS_PEER_VERIFY_NONE;
+	(void)zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY, &verify, sizeof(verify));
+	static const char ocid_host[] = "us1.unwiredlabs.com";
+	(void)zsock_setsockopt(sock, SOL_TLS, TLS_HOSTNAME, ocid_host, strlen(ocid_host));
+
+	if (zsock_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+		LOG_ERR("OpenCellID connect failed: %d", errno);
+		zsock_close(sock);
+		zsock_freeaddrinfo(res);
+		location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_ERROR, NULL);
+		return;
+	}
+	zsock_freeaddrinfo(res);
+
+	/* Re-use the same http_response_cb pattern but with local buffers. */
+	struct http_response ocid_rsp_data = { 0 };
+	ARG_UNUSED(ocid_rsp_data);
+
+	/* Simple inline response accumulator for OpenCellID. */
+	static struct { uint8_t *buf; char *body; size_t *body_len; int *status; } ocid_ctx;
+	ocid_ctx.buf      = ocid_recv_buf;
+	ocid_ctx.body     = ocid_body;
+	ocid_ctx.body_len = &ocid_body_len;
+	ocid_ctx.status   = &ocid_status;
+
+	const char *ocid_headers[] = { "Content-Type: application/json\r\n", NULL };
+	struct http_request ocid_req = {
+		.method        = HTTP_POST,
+		.url           = "/v2/process",
+		.host          = ocid_host,
+		.protocol      = "HTTP/1.1",
+		.header_fields = ocid_headers,
+		.payload       = body,
+		.payload_len   = strlen(body),
+		.response      = http_response_cb,  /* reuses global http_body / http_status */
+		.recv_buf      = http_recv_buf,
+		.recv_buf_len  = sizeof(http_recv_buf),
+	};
+
+	/* Note: http_response_cb writes into the global http_body / http_status.
+	 * This is safe because cellular_location_request() is only called from the
+	 * location event handler (main thread context), not concurrently with an FMD
+	 * HTTP request. */
+	http_status = 0; http_body_len = 0; http_body[0] = '\0';
+	int ret = http_client_req(sock, &ocid_req, 15 * MSEC_PER_SEC, NULL);
+	zsock_close(sock);
+
+	if (ret < 0 || http_status != 200) {
+		LOG_WRN("OpenCellID request failed: ret=%d status=%d", ret, http_status);
+		location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_ERROR, NULL);
+		return;
+	}
+
+	/* Parse {"status":"ok","lat":...,"lon":...,"accuracy":...} */
+	double lat = 0.0, lon = 0.0, acc = 1000.0;
+	char status_str[8] = "";
+	/* Simple sscanf extraction — fields may come in any order so try each. */
+	char *p;
+	if ((p = strstr(http_body, "\"lat\":"))  != NULL) { sscanf(p, "\"lat\":%lf",  &lat); }
+	if ((p = strstr(http_body, "\"lon\":"))  != NULL) { sscanf(p, "\"lon\":%lf",  &lon); }
+	if ((p = strstr(http_body, "\"accuracy\":")) != NULL) { sscanf(p, "\"accuracy\":%lf", &acc); }
+	if ((p = strstr(http_body, "\"status\":\"")) != NULL) {
+		sscanf(p, "\"status\":\"%7[^\"]\"", status_str);
+	}
+
+	if (strcmp(status_str, "ok") != 0) {
+		LOG_WRN("OpenCellID: non-ok status '%s' body: %.100s", status_str, http_body);
+		location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_ERROR, NULL);
+		return;
+	}
+
+	struct location_data fix = {
+		.latitude  = lat,
+		.longitude = lon,
+		.accuracy  = (float)acc,
+	};
+	LOG_INF("OpenCellID fix: %.5f, %.5f (+/- %.0f m) mcc=%d mnc=%d tac=%u cid=%u",
+		lat, lon, acc, cell->mcc, cell->mnc,
+		(unsigned)cell->tac, (unsigned)cell->id);
+	location_cloud_location_ext_result_set(LOCATION_EXT_RESULT_SUCCESS, &fix);
+}
+#endif /* CONFIG_LOCATION_METHOD_CELLULAR */
 
 /* Build the FMD location JSON. PLAINTEXT for the prototype (crypto stub).
  * Field names match fmd-server web client Location interface
@@ -647,6 +862,9 @@ int main(void)
 		uart_send_line(SP_MSG_RCP_STATUS, "LTE_UP");
 		log_network_status();
 		(void)date_time_update_async(NULL);
+		/* Pre-resolve the FMD server hostname right after attach so the first
+		 * upload doesn't pay a DNS RTT while the location is still warm. */
+		resolve_fmd_host();
 	} else {
 		LOG_WRN("LTE not up after 120s — continuing; will retry uploads when registered");
 	}
@@ -666,15 +884,23 @@ int main(void)
 			uart_send_line(SP_MSG_RCP_STATUS, "LTE_UP");
 			log_network_status();
 			(void)date_time_update_async(NULL);
+			resolve_fmd_host();
 		}
 
 		bool forced = atomic_set(&upload_request, 0) == 1;
 		if (forced || now - last_upload >= UPLOAD_PERIOD_MS) {
-			/* GNSS works without LTE; attempt a fix regardless. The upload
-			 * itself no-ops without registration / a token. */
 			uart_send_line(SP_MSG_RCP_STATUS, "GNSS_SEARCH");
-			request_location();           /* async; handler fills last_fix */
-			k_sleep(K_SECONDS(8));         /* give the fix a chance to land */
+			request_location();   /* async; location_event_handler fires on result */
+
+			/* Wait for the fix attempt to complete (GNSS up to 30 s timeout,
+			 * then cellular via OpenCellID). Poll in 1 s ticks; total wait cap
+			 * = GNSS timeout (30 s) + cellular RTT (~5 s) + headroom. */
+			for (int wait = 0;
+			     wait < 45 && atomic_get(&location_in_progress) == 1;
+			     wait++) {
+				k_sleep(K_SECONDS(1));
+			}
+
 			if (registered) {
 				upload_location();
 			}
